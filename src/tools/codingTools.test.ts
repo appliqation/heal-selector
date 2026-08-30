@@ -1,0 +1,251 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, symlinkSync, mkdirSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const { mockExecFile } = vi.hoisted(() => ({ mockExecFile: vi.fn() }));
+vi.mock('node:child_process', () => ({ execFile: mockExecFile }));
+
+const { CodingTools } = await import('./codingTools.js');
+
+/** Makes the promisified execFile resolve like a real successful process. */
+function mockExecSuccess(stdout: string, stderr = '') {
+  mockExecFile.mockImplementation((_file: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
+    process.nextTick(() => cb(null, stdout, stderr));
+  });
+}
+
+/** Makes the promisified execFile reject like a real failed process (non-zero exit). */
+function mockExecFailure(code: number, stdout = '', stderr = 'boom') {
+  mockExecFile.mockImplementation((_file: string, _args: string[], _opts: unknown, cb: (...a: unknown[]) => void) => {
+    const err = Object.assign(new Error(`Command failed`), { code });
+    // Node's real execFile callback passes stdout/stderr as separate
+    // positional args even on failure — not properties pre-attached to the
+    // error object, which is what the wrapper under test actually reads.
+    process.nextTick(() => cb(err, stdout, stderr));
+  });
+}
+
+describe('CodingTools', () => {
+  let dir: string;
+  let tools: InstanceType<typeof CodingTools>;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'heal-selector-test-'));
+    tools = new CodingTools(dir, 30_000);
+    mockExecFile.mockReset();
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  describe('write_file / read_file', () => {
+    it('writes a file and reads it back', async () => {
+      const writeResult = await tools.dispatch('write_file', { path: 'tests/appliqation/scenario-1/uuid.spec.ts', content: 'const x = 1;' });
+      expect(writeResult.ok).toBe(true);
+      expect(existsSync(join(dir, 'tests/appliqation/scenario-1/uuid.spec.ts'))).toBe(true);
+
+      const readResult = await tools.dispatch('read_file', { path: 'tests/appliqation/scenario-1/uuid.spec.ts' });
+      expect(readResult.ok).toBe(true);
+      expect(readResult.text).toBe('const x = 1;');
+    });
+
+    it('records the written path with a timestamp', async () => {
+      await tools.dispatch('write_file', { path: 'spec.ts', content: 'x' });
+      const written = tools.getWrittenPaths();
+      expect(written.has('spec.ts')).toBe(true);
+      expect(written.get('spec.ts')).toBeGreaterThan(0);
+    });
+
+    it('refuses to read a path that escapes the repo root', async () => {
+      const result = await tools.dispatch('read_file', { path: '../../etc/passwd' });
+      expect(result.ok).toBe(false);
+      expect(result.text).toMatch(/escapes the target repo root/);
+    });
+
+    it('refuses to write a path that escapes the repo root, and does not create the file', async () => {
+      await expect(tools.dispatch('write_file', { path: '../outside.txt', content: 'x' })).rejects.toThrow(/escapes the target repo root/);
+      expect(existsSync(join(tmpdir(), 'outside.txt'))).toBe(false);
+    });
+
+    it('returns a clear error for a nonexistent file rather than throwing', async () => {
+      const result = await tools.dispatch('read_file', { path: 'nope.ts' });
+      expect(result.ok).toBe(false);
+      expect(result.text).toMatch(/Could not read/);
+    });
+
+    describe("symlinks — the lexical check above can't catch these", () => {
+      let outsideDir: string;
+
+      beforeEach(() => {
+        outsideDir = mkdtempSync(join(tmpdir(), 'heal-selector-outside-'));
+        writeFileSync(join(outsideDir, 'secret.txt'), 'top secret');
+      });
+
+      afterEach(() => {
+        rmSync(outsideDir, { recursive: true, force: true });
+      });
+
+      it('refuses to read through a symlinked directory whose target resolves outside the repo root', async () => {
+        symlinkSync(outsideDir, join(dir, 'escape'), 'dir');
+        const result = await tools.dispatch('read_file', { path: 'escape/secret.txt' });
+        expect(result.ok).toBe(false);
+        expect(result.text).toMatch(/escapes the target repo root via a symlink/);
+      });
+
+      it('still allows a symlink whose target resolves within the repo root', async () => {
+        mkdirSync(join(dir, 'real-subdir'));
+        writeFileSync(join(dir, 'real-subdir', 'file.txt'), 'inside content');
+        symlinkSync(join(dir, 'real-subdir'), join(dir, 'alias'), 'dir');
+
+        const result = await tools.dispatch('read_file', { path: 'alias/file.txt' });
+        expect(result.ok).toBe(true);
+        expect(result.text).toBe('inside content');
+      });
+
+      it('does not break writing a genuinely new file in a not-yet-created nested directory (no symlink involved)', async () => {
+        const result = await tools.dispatch('write_file', { path: 'brand/new/nested/file.ts', content: 'x' });
+        expect(result.ok).toBe(true);
+        expect(readFileSync(join(dir, 'brand/new/nested/file.ts'), 'utf-8')).toBe('x');
+      });
+    });
+  });
+
+  describe('list_directory', () => {
+    it('lists files and directories, sorted, with type markers', async () => {
+      writeFileSync(join(dir, 'b.txt'), 'x');
+      writeFileSync(join(dir, 'a.txt'), 'x');
+      mkdirSync(join(dir, 'sub'));
+      const result = await tools.dispatch('list_directory', { path: '.' });
+      expect(result.ok).toBe(true);
+      const lines = result.text.split('\n');
+      expect(lines).toEqual(['dir   sub', 'file  a.txt', 'file  b.txt']);
+    });
+
+    it('defaults to the repo root when no path is given', async () => {
+      writeFileSync(join(dir, 'x.txt'), 'x');
+      const result = await tools.dispatch('list_directory', {});
+      expect(result.text).toContain('x.txt');
+    });
+  });
+
+  describe('run_command — allowlist enforcement', () => {
+    it('refuses a disallowed command without ever calling execFile', async () => {
+      const result = await tools.dispatch('run_command', { command: 'rm', args: ['-rf', '/'] });
+      expect(result.ok).toBe(false);
+      expect(result.text).toMatch(/not in the allowlist/);
+      expect(mockExecFile).not.toHaveBeenCalled();
+    });
+
+    it('refuses npm entirely — this agent never bootstraps a project', async () => {
+      const result = await tools.dispatch('run_command', { command: 'npm', args: ['install', '-D', '@playwright/test'] });
+      expect(result.ok).toBe(false);
+      expect(mockExecFile).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('run_command — allowed command execution and tracking', () => {
+    it('runs an allowed command, scoped to the repo root as cwd', async () => {
+      mockExecSuccess('1.0.0\n');
+      const result = await tools.dispatch('run_command', { command: 'node', args: ['--version'] });
+      expect(result.ok).toBe(true);
+      expect(result.text).toContain('1.0.0');
+      expect(mockExecFile).toHaveBeenCalledWith('node', ['--version'], expect.objectContaining({ cwd: dir }), expect.any(Function));
+    });
+
+    it('records a successful run in the command history', async () => {
+      mockExecSuccess('ok');
+      await tools.dispatch('run_command', { command: 'node', args: ['--version'] });
+      const history = tools.getCommandHistory();
+      expect(history).toHaveLength(1);
+      expect(history[0]).toMatchObject({ command: 'node', args: ['--version'], exitCode: 0, ok: true });
+    });
+
+    it('reports failure with the real exit code, not a fabricated one', async () => {
+      mockExecFailure(1, '', '1 failed\n  Expected: visible\n  Received: hidden');
+      const result = await tools.dispatch('run_command', { command: 'npx', args: ['playwright', 'test'] });
+      expect(result.ok).toBe(false);
+      expect(result.text).toContain('1 failed');
+      const history = tools.getCommandHistory();
+      expect(history[0]).toMatchObject({ ok: false, exitCode: 1 });
+    });
+
+    it('lastPlaywrightTestRun returns null when no test run has happened', () => {
+      expect(tools.lastPlaywrightTestRun()).toBeNull();
+    });
+
+    it('lastPlaywrightTestRun returns the most recent playwright test invocation, real outcome included', async () => {
+      mockExecFailure(1, '', '1 failed');
+      await tools.dispatch('run_command', { command: 'npx', args: ['playwright', 'test'] });
+      mockExecSuccess('1 passed');
+      await tools.dispatch('run_command', { command: 'npx', args: ['playwright', 'test'] });
+
+      const last = tools.lastPlaywrightTestRun();
+      expect(last).toMatchObject({ ok: true, exitCode: 0 });
+    });
+
+    it("the model cannot fabricate a pass — the tool result always reflects execFile's real outcome", async () => {
+      mockExecFailure(1, '', 'assertion failed');
+      const result = await tools.dispatch('run_command', { command: 'npx', args: ['playwright', 'test'] });
+      expect(result.ok).toBe(false);
+    });
+
+    it("does not leak this agent's own secrets to the child — ANTHROPIC/APPQ_API_KEY, GITHUB_TOKEN", async () => {
+      process.env.ANTHROPIC_API_KEY = 'sk-super-secret';
+      process.env.APPQ_API_KEY = 'appq-mcp-secret';
+      process.env.GITHUB_TOKEN = 'ghp_secret';
+      mockExecSuccess('ok');
+      await tools.dispatch('run_command', { command: 'node', args: ['--version'] });
+      const passedEnv = mockExecFile.mock.calls[0][2].env;
+      expect(passedEnv.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(passedEnv.APPQ_API_KEY).toBeUndefined();
+      expect(passedEnv.GITHUB_TOKEN).toBeUndefined();
+      expect(passedEnv.PATH).toBe(process.env.PATH);
+      delete process.env.ANTHROPIC_API_KEY;
+      delete process.env.APPQ_API_KEY;
+      delete process.env.GITHUB_TOKEN;
+    });
+
+    it("passes through @appliqation/automation-sdk's own env vars — the target script needs these to authenticate and report", async () => {
+      process.env.APPLIQATION_API_KEY = 'appq_live_secret';
+      process.env.APPQ_AUTH_STATE_DIR = '/home/user/.appq-auth';
+      process.env.APPLIQATION_SUT_BASE_URL = 'https://staging.example.com';
+      mockExecSuccess('ok');
+      await tools.dispatch('run_command', { command: 'npx', args: ['playwright', 'test'] });
+      const passedEnv = mockExecFile.mock.calls[0][2].env;
+      expect(passedEnv.APPLIQATION_API_KEY).toBe('appq_live_secret');
+      expect(passedEnv.APPQ_AUTH_STATE_DIR).toBe('/home/user/.appq-auth');
+      expect(passedEnv.APPLIQATION_SUT_BASE_URL).toBe('https://staging.example.com');
+      delete process.env.APPLIQATION_API_KEY;
+      delete process.env.APPQ_AUTH_STATE_DIR;
+      delete process.env.APPLIQATION_SUT_BASE_URL;
+    });
+
+    it('passes through per-project/role SUT credentials (APPQ_PROJECT_<id>_<ROLE>_*) via the narrow pattern', async () => {
+      process.env.APPQ_PROJECT_126_DEFAULT_USERNAME = 'tester';
+      mockExecSuccess('ok');
+      await tools.dispatch('run_command', { command: 'npx', args: ['playwright', 'test'] });
+      const passedEnv = mockExecFile.mock.calls[0][2].env;
+      expect(passedEnv.APPQ_PROJECT_126_DEFAULT_USERNAME).toBe('tester');
+      delete process.env.APPQ_PROJECT_126_DEFAULT_USERNAME;
+    });
+
+    it("the per-project pattern never matches this agent's own APPQ_API_KEY — no _PROJECT_<id>_ segment", async () => {
+      process.env.APPQ_API_KEY = 'appq-mcp-secret';
+      mockExecSuccess('ok');
+      await tools.dispatch('run_command', { command: 'npx', args: ['playwright', 'test'] });
+      const passedEnv = mockExecFile.mock.calls[0][2].env;
+      expect(passedEnv.APPQ_API_KEY).toBeUndefined();
+      delete process.env.APPQ_API_KEY;
+    });
+  });
+
+  describe('dispatch — unknown tool', () => {
+    it('returns an explicit error for an unrecognized tool name', async () => {
+      const result = await tools.dispatch('delete_everything', {});
+      expect(result.ok).toBe(false);
+      expect(result.text).toMatch(/Unknown coding tool/);
+    });
+  });
+});

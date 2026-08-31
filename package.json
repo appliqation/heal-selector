@@ -1,7 +1,7 @@
 {
   "name": "@appliqation/heal-selector",
-  "version": "0.1.0",
-  "description": "Standalone agent that heals one broken Playwright selector in an existing script — narrow and token-efficient, never a full regenerate. Verifies a healed selector targets the same semantic element (accessibility role + name, the test case's own expected_result) before touching anything; declines rather than guesses.",
+  "version": "0.1.1",
+  "description": "Standalone agent that heals one broken Playwright selector in an existing script: narrow and token-efficient, never a full regenerate. Verifies a healed selector targets the same semantic element (accessibility role + name, the test case's own expected_result) before touching anything; declines rather than guesses.",
   "license": "MIT",
   "repository": {
     "type": "git",

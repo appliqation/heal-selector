@@ -42,6 +42,20 @@ nothing, report clearly why, and let a human or `appliqation-defect-fix` take it
 there. See `src/policy/healPrompt.ts` for the full methodology text (the actual
 "Non-negotiable" instruction lives there, word for word).
 
+**Scope is strictly the locator, never the assertion.** Confirmed via a live
+verification run (Aug 2026, DailyPulse scenario 1350): given a script whose selector
+was untouched but whose assertion hardcoded the wrong expected URL, the model correctly
+found no locator to heal — but, before this was tightened, it went ahead and rewrote
+the assertion to match the TC's own `expected_result` instead of declining, and
+reported `verified: true`. That's not the semantic-identity violation the Non-negotiable
+rule guards against (it cross-checked a real source of truth, not just "whatever makes
+it pass"), but it's still out of scope: deciding a hardcoded assertion is wrong is a
+judgment call about what the test *should* verify, which belongs to a human or
+`appliqation-defect-fix`, not to a tool whose whole reason for existing is "I only ever
+touch one locator." `healPrompt.ts`'s Phase 2 now has an explicit third diagnostic
+branch for this — locator resolves fine, real failure is elsewhere → decline, same as
+"no matching candidate exists."
+
 ## No appq-served prompt exists for this (unlike scriptgen/defect-fix/explorer)
 
 Every other "thin" agent in this family (`scriptgen`, `defect-fix`, `explorer`) is

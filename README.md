@@ -43,6 +43,29 @@ appliqation-heal-selector heal \
 
 Add `--json`/`--ci` for a structured summary. The exit code is 0 only when a patch was written *and* independently verified by a real, post-patch test run. A decline, or an unverified attempt, both exit non-zero; the JSON summary's `declined` field tells them apart.
 
+## CLI reference
+
+`appliqation-heal-selector heal [options]`
+
+**Required:**
+
+| Option | Description |
+|---|---|
+| `--test-case-uuid <uuid>` | Test case this failing selector belongs to. |
+| `--script-path <path>` | The script file containing the broken selector, relative to `--repo-path`. |
+| `--failure <text>` | Free-text description of what is failing and why: a step name, the selector, an error message. Whatever the caller already knows. |
+| `--environment <name>` | Environment name — its URL (from `get_project_settings`) is what the browser navigates to. |
+
+**Optional:**
+
+| Option | Description |
+|---|---|
+| `--defect-id <id>` | A defect linked to this failure, if known — offered as extra diagnostic context. |
+| `--repo-path <path>` | Target repo root every file/command tool call is scoped to. Defaults to the current working directory. |
+| `--max-turns <n>` | Override `BUDGET_MAX_TURNS` for this run. |
+| `--json` | Print a single structured JSON summary on stdout instead of a human-readable report. |
+| `--ci` | Shorthand for `--json`; exit code already reflects the real, `execFile`-verified outcome either way. |
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Requires `APPQ_API_KEY` (read-only access is sufficient; this agent never calls an appq write tool) and one of `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`.
